@@ -27,7 +27,7 @@ type Stream interface {
 
 func NewStream(ssrc uint32, timeout time.Duration, sendPacket func(*Packet) error) Stream {
 	return &stream{
-		frameQueue: NewFrameQueue(),
+		frameQueue: NewFrameWaitQueue(),
 		frameMap:   make(map[uint32]*Frame),
 		timeout:    timeout,
 		sendPacket: sendPacket,
@@ -37,7 +37,7 @@ func NewStream(ssrc uint32, timeout time.Duration, sendPacket func(*Packet) erro
 }
 
 type stream struct {
-	frameQueue FrameQueue
+	frameQueue *FrameWaitQueue
 
 	mutex sync.Mutex
 
@@ -64,34 +64,32 @@ func (s *stream) dispatch(p *Packet) error {
 	if p.SSRC != s.ssrc {
 		return errors.New("packet not SSRC stream")
 	}
-	timeout := p.Timestamp
+	timestamp := p.Timestamp
 
 	var f *Frame
 	curr := s.currFrame
 	if curr != nil {
-		if timeout < curr.Timestamp() {
+		if timestamp < curr.Timestamp() {
 			return errors.New("packet too old")
-		} else if timeout == curr.Timestamp() {
+		} else if timestamp == curr.Timestamp() {
 			f = curr
 		}
 	}
 
 	if f == nil {
 		s.mutex.Lock()
-
-		f = s.frameMap[timeout]
+		f = s.frameMap[timestamp]
 		if f == nil {
 			f = NewFrame(nil)
 		}
-		s.frameMap[timeout] = f
+		s.frameMap[timestamp] = f
+		s.mutex.Unlock()
 		s.frameQueue.Push(f)
 
 		// heading
 		if f.prevFrame == nil && curr != nil {
 			f.prevFrame = curr
 		}
-
-		s.mutex.Unlock()
 	}
 
 	if ok := f.Push(p); ok != AcceptOk {
@@ -101,9 +99,10 @@ func (s *stream) dispatch(p *Packet) error {
 }
 
 func (s *stream) ReadFrame(ctx context.Context) (*Frame, error) {
-	s.mutex.Lock()
-	f := s.frameQueue.Pop()
-	s.mutex.Unlock()
+	f, err := s.frameQueue.Pop(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	if f == nil {
 		return nil, errors.New("no packets")

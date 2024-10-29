@@ -1,6 +1,7 @@
 package rtp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 
 type Conn interface {
 	Stream(uint32) Stream
+	Close() error
 }
 
 func NewConn(io io.ReadWriteCloser, timeout time.Duration) Conn {
@@ -18,11 +20,21 @@ func NewConn(io io.ReadWriteCloser, timeout time.Duration) Conn {
 		timeout:         timeout,
 		streams:         map[uint32]Stream{},
 		writeCh:         make(chan *Packet, 100),
-		done:            make(chan bool, 1),
+		dispatchCh:      make(chan dispatchItem, 100),
 	}
+
+	var ctx context.Context
+	ctx, c.done = context.WithCancel(context.Background())
+
 	go c.readPump()
-	go c.writePump()
+	go c.writePump(ctx)
+	go c.dispatchPump(ctx)
 	return c
+}
+
+type dispatchItem struct {
+	s Stream
+	p *Packet
 }
 
 type conn struct {
@@ -31,9 +43,10 @@ type conn struct {
 	timeout time.Duration
 	streams map[uint32]Stream
 
-	writeCh chan *Packet
-	done    chan bool
-	closed  bool
+	writeCh    chan *Packet
+	dispatchCh chan dispatchItem
+	done       context.CancelFunc
+	closed     bool
 }
 
 func (c *conn) Stream(ssrc uint32) Stream {
@@ -48,8 +61,8 @@ func (c *conn) Stream(ssrc uint32) Stream {
 }
 
 func (c *conn) readPump() {
-	for {
-		var buff = make([]byte, 1500)
+	var buff = make([]byte, 1500)
+	for !c.closed {
 		n, err := c.Read(buff)
 		if err != nil {
 			fmt.Print("read error: ", err)
@@ -58,7 +71,7 @@ func (c *conn) readPump() {
 
 		p := &Packet{}
 		code := p.Decode(buff[:n])
-		if code != Ok {
+		if code < 0 {
 			fmt.Print("packet parse error: ", code)
 			break
 		}
@@ -72,12 +85,26 @@ func (c *conn) readPump() {
 		}
 		c.Unlock()
 
-		go func(s Stream, p *Packet) {
-			err = s.dispatch(p)
+		fmt.Println("packet seq: ", p.Seq)
+		c.dispatchCh <- dispatchItem{
+			s: s,
+			p: p,
+		}
+	}
+}
+
+func (c *conn) dispatchPump(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case d := <-c.dispatchCh:
+			err := d.s.dispatch(d.p)
 			if err != nil {
-				fmt.Print("stream dispatch error: ", err)
+				fmt.Println("stream dispatch error: ", err)
 			}
-		}(s, p)
+		}
 	}
 }
 
@@ -89,12 +116,12 @@ func (c *conn) writePacket(p *Packet) error {
 	return nil
 }
 
-func (c *conn) writePump() {
+func (c *conn) writePump(ctx context.Context) {
 	defer c.Close()
 
 	for {
 		select {
-		case <-c.done:
+		case <-ctx.Done():
 			return
 
 		case p := <-c.writeCh:
@@ -106,7 +133,6 @@ func (c *conn) writePump() {
 			}
 		}
 	}
-
 }
 
 func (c *conn) Close() error {
@@ -114,6 +140,6 @@ func (c *conn) Close() error {
 		return nil
 	}
 	c.closed = true
-	c.done <- true
+	c.done()
 	return c.ReadWriteCloser.Close()
 }

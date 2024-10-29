@@ -1,5 +1,10 @@
 package rtp
 
+import (
+	"context"
+	"sync"
+)
+
 const (
 	prevFrameNone = iota
 	prevFrameDrain
@@ -123,6 +128,63 @@ func (f *Frame) prevFrameTimestamp() uint32 {
 		return 0
 	}
 	return f.prevFrame.First().Timestamp
+}
+
+func NewFrameWaitQueue() *FrameWaitQueue {
+	return &FrameWaitQueue{
+		mutex:  &sync.Mutex{},
+		queue:  NewFrameQueue(),
+		notify: make(chan int, 1),
+	}
+}
+
+type FrameWaitQueue struct {
+	mutex  *sync.Mutex
+	queue  FrameQueue
+	notify chan int
+}
+
+func (fw *FrameWaitQueue) Push(f *Frame) bool {
+	fw.mutex.Lock()
+	defer fw.mutex.Unlock()
+
+	empty := fw.queue.Empty()
+	res := fw.queue.Push(f)
+	if res && empty {
+		fw.notify <- 1
+	}
+	return res
+}
+
+func (fw *FrameWaitQueue) Pop(ctx context.Context) (*Frame, error) {
+	// first check
+	fw.mutex.Lock()
+	f := fw.queue.Pop()
+	fw.mutex.Unlock()
+	if f != nil {
+		return f, nil
+	}
+
+	// second loop check
+	for fw.queue.Empty() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-fw.notify:
+			fw.mutex.Lock()
+			f := fw.queue.Pop()
+			fw.mutex.Unlock()
+			if f != nil {
+				return f, nil
+			}
+		}
+	}
+
+	// second double check
+	fw.mutex.Lock()
+	f = fw.queue.Pop()
+	fw.mutex.Unlock()
+	return f, nil
 }
 
 type FrameQueue interface {
